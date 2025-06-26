@@ -1,0 +1,18 @@
+# Core scientific stack
+numpy
+pandas
+scipy           
+xarray
+dask[complete]  
+netCDF4
+cfgrib         
+
+# API / networking
+requests        
+tqdm            
+
+# Optional for now
+matplotlib       
+seaborn         
+jupyterlab
+
