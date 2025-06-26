@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """
+THIS CONVERGES SUPER FAST DUE TO LACK OF DATA RIGHT NOW
 Minimal 2-D advection–diffusion PINN for Denver PM2.5.
 
 Inputs : (x, y, t)  scaled to [-1, 1]
