@@ -1,43 +1,96 @@
 #!/usr/bin/env python
 """
-Merge kriged PM₂.₅ and ERA5 fields into a single (time, lat, lon, channel) array
-and save npz ready for a PyTorch dataloader.
+build_tensor.py   (1–7 July 2023 Denver)
+
+Creates a flat tensor for the PINN:
+
+    X  →  [lon_norm, lat_norm, t_norm, u10_z, v10_z]
+    Y  →  pm25
+    t_idx → integer hour index (0 … 167)
+
+Inputs
+------
+raw/epa/by_hour/hourly_2023070[1‑7]_HH.csv
+prep/era5_grid_2023-07-0[1‑7].nc
+
+Output
+------
+prep/train_tensor.npz
 """
-import glob, numpy as np, xarray as xr, pathlib
-from sklearn.preprocessing import StandardScaler
 
-grid = xr.open_dataset("prep/blank_grid.nc")
+import glob, pathlib
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import xarray as xr
 
-# concat all daily files you generated in steps 6–7
-pm25_files = sorted(glob.glob("prep/pm25_grid_*.nc"))
-era5_files = [f"prep/era5_grid_{f.split('_')[-1]}" for f in pm25_files]
+# ─── 1 ▸ locate per‑hour CSVs ───────────────────────────────────────────────
+epa_files = sorted(glob.glob("raw/epa/by_hour/hourly_2023070[1-7]_*.csv"))
+if not epa_files:
+    raise SystemExit("❌  No EPA hourly CSVs found for 2023‑07‑01…07")
 
-pm25 = xr.open_mfdataset(pm25_files, combine="nested", concat_dim="time")
-era5 = xr.open_mfdataset(era5_files, combine="nested", concat_dim="time")
+era5_daily = {f"2023-07-{d:02d}": f"prep/era5_grid_2023-07-{d:02d}.nc"
+              for d in range(1, 8)}
 
-ds = xr.merge([pm25, era5])      # same coords; merges along time
+X_parts, Y_parts, t_parts = [], [], []
 
-# stack lat/lon so we can scale features easily
-stacked = ds.stack(points=("lat", "lon"))
+# ─── 2 ▸ loop over hours ────────────────────────────────────────────────────
+for ti, f in enumerate(epa_files):
+    df = pd.read_csv(
+        f,
+        usecols=["latitude", "longitude", "sample_measurement"],
+        dtype={"latitude": "float32",
+               "longitude": "float32",
+               "sample_measurement": "float32"},
+    ).rename(columns={"sample_measurement": "pm25"})
+    if df.empty:
+        continue
 
-# scale independent variables
-X_raw = stacked[["10m_u_component_of_wind",
-                 "10m_v_component_of_wind",
-                 "2m_temperature"]].to_array().transpose("time","points","variable")
-Y_raw = stacked["pm25"].values[..., None]   # make last dim 1
+    # day & hour from file name
+    stem = Path(f).stem                    # e.g. hourly_20230701_00
+    day  = stem[7:15]                      # 20230701
+    hour = int(stem[-2:])                  # 00 … 23
+    nc   = era5_daily[f"{day[:4]}-{day[4:6]}-{day[6:]}"]
 
-scaler = StandardScaler().fit(X_raw.reshape(-1, X_raw.shape[-1]))
-X_scaled = scaler.transform(X_raw.reshape(-1, X_raw.shape[-1])
-                            ).reshape(X_raw.shape)
+    winds = xr.open_dataset(nc).isel(time=hour)
+    # spatial mean winds over domain
+    u10 = float(winds["10m_u_component_of_wind"].mean())
+    v10 = float(winds["10m_v_component_of_wind"].mean())
 
-# save
+    n = len(df)
+    X_parts.append(np.column_stack([
+        df.longitude.values,
+        df.latitude .values,
+        np.full(n, ti, dtype=np.float32),      # raw hour index
+        np.full(n, u10, dtype=np.float32),
+        np.full(n, v10, dtype=np.float32),
+    ]))
+    Y_parts.append(df.pm25.values[:, None])
+    t_parts.append(np.full(n, ti, dtype=np.int32))
+
+# ─── 3 ▸ concat & normalise ─────────────────────────────────────────────────
+X_all = np.vstack(X_parts).astype(np.float32)
+Y_all = np.vstack(Y_parts).astype(np.float32)
+t_idx = np.concatenate(t_parts)
+
+# scale lon, lat, t to [‑1, 1]
+for col in (0, 1, 2):
+    mn, rng = X_all[:, col].min(), np.ptp(X_all[:, col])
+    X_all[:, col] = 2 * (X_all[:, col] - mn) / rng - 1
+
+# z‑score winds
+for col in (3, 4):
+    mu, sig = X_all[:, col].mean(), X_all[:, col].std()
+    X_all[:, col] = (X_all[:, col] - mu) / sig
+
+# ─── 4 ▸ save tensor ────────────────────────────────────────────────────────
+pathlib.Path("prep").mkdir(exist_ok=True)
 np.savez_compressed(
     "prep/train_tensor.npz",
-    X=X_scaled.astype(np.float32),  # (time, pts, 3)
-    Y=Y_raw.astype(np.float32),     # (time, pts, 1)
-    lon=grid.lon.values,
-    lat=grid.lat.values
+    X=X_all,
+    Y=Y_all,
+    t_idx=t_idx
 )
-print("✓ training tensor → prep/train_tensor.npz  ",
-      X_scaled.shape, Y_raw.shape)
+print("✓ Wrote prep/train_tensor.npz:",
+      f"samples={X_all.shape[0]} dims={X_all.shape[1]} hours={len(epa_files)}")
 
