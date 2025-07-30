@@ -1,0 +1,129 @@
+"""
+this version is bad but instructive. overtightening the PDE penalty led to worse accuracy
+────────────────────────────────────────────────────────
+• lr 3e‑5, weight‑decay 1e‑6, ReduceLROnPlateau
+• λ_PDE ramp 0→250 over first 300 epochs
+• Plume weight ×50
+• Batch 1024, collocation 4 000
+• D clamped 0.01–0.3 (inside torch.no_grad)
+"""
+
+import math, argparse, pathlib, numpy as np, torch, torch.nn as nn
+import matplotlib.pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+tt = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
+
+# ───── Fourier features ────────────────────────────────────────────────────
+def fourier_xy(xy, L=10):
+    f = torch.logspace(0, math.log10(10), L, device=xy.device)
+    p = 2 * math.pi * xy[..., None] * f
+    return torch.cat([torch.sin(p), torch.cos(p)], -1).flatten(-2)
+
+# ───── PINN model ──────────────────────────────────────────────────────────
+class PINN(nn.Module):
+    def __init__(self, hidden=128, depth=7, Lf=10, act="tanh", drop=0.1):
+        super().__init__()
+        actf = nn.Tanh if act == "tanh" else nn.ReLU
+        layers, d = [], 4 * Lf + 3
+        for _ in range(depth):
+            layers += [nn.Linear(d, hidden), actf(), nn.Dropout(drop)]
+            d = hidden
+        layers += [nn.Linear(hidden, 1)]
+        self.net = nn.Sequential(*layers)
+        self.D   = nn.Parameter(torch.tensor(0.05))
+        self.Lf  = Lf
+    def forward(self, x, log=False):
+        enc = fourier_xy(x[:, :2], self.Lf)
+        z   = torch.cat([enc, x[:, 2:]], -1)
+        f   = torch.clamp(self.net(z), -15., 5.)
+        return f if log else torch.expm1(f)
+
+# ───── PDE residual ────────────────────────────────────────────────────────
+def pde_res(model, x):
+    x = x.clone().requires_grad_(True)
+    C = model(x)
+    g = torch.autograd.grad(C, x, torch.ones_like(C), create_graph=True)[0]
+    dCdx, dCdy, dCdt = g[:,0:1], g[:,1:2], g[:,2:3]
+    d2x = torch.autograd.grad(dCdx, x, torch.ones_like(dCdx),
+                              create_graph=True)[0][:,0:1]
+    d2y = torch.autograd.grad(dCdy, x, torch.ones_like(dCdy),
+                              create_graph=True)[0][:,1:2]
+    u,v = x[:,3:4], x[:,4:5]
+    return (dCdt + u*dCdx + v*dCdy - model.D*(d2x+d2y)).square().mean()
+
+# ───── main ────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--epochs", type=int, default=400)
+    ap.add_argument("--lr",     type=float, default=3e-5)
+    ap.add_argument("--resume", type=str,   default=None)
+    ap.add_argument("--activation", default="tanh", choices=["tanh","relu"])
+    args = ap.parse_args()
+
+    d      = np.load("prep/train_tensor.npz")
+    X_all  = d["X"]
+    Y_all  = np.clip(d["Y"], 0., None).astype(np.float32).reshape(-1, 1) # (N,1)
+    hour   = d["t_idx"];  H = hour.max() + 1;  split = int(0.8 * H)
+    tr,te  = hour < split, hour >= split
+    X_tr,Y_tr = tt(X_all[tr]), tt(Y_all[tr])
+    X_te,Y_te = tt(X_all[te]), tt(Y_all[te])
+    print(f"TRAIN {len(X_tr):,}  TEST {len(X_te):,}  (split hr {split}/{H})")
+
+    # plume weight ×50
+    w = torch.as_tensor(((Y_all[tr] > 50).astype(np.float32).ravel()*49)+1,
+                        dtype=torch.float32)
+    loader = DataLoader(TensorDataset(X_tr, Y_tr),
+                        batch_size=1024,
+                        sampler=WeightedRandomSampler(w, len(w), replacement=True))
+
+    model = PINN(act=args.activation).to(device)
+    if args.resume:
+        model.load_state_dict(torch.load(args.resume, map_location=device))
+        print(f"✓ resumed from {args.resume}")
+
+    opt   = torch.optim.Adam(model.parameters(),
+                             lr=args.lr, weight_decay=1e-6)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt,factor=0.5,
+                                                       patience=25,verbose=True)
+    huber = nn.SmoothL1Loss(beta=20.0); λD=0.01; D0=math.log(0.05)
+    hist = []
+
+    for ep in range(args.epochs + 1):
+        model.train(); opt.zero_grad()
+        xb,yb = next(iter(loader))
+        dL    = huber(model(xb), yb)
+        col   = X_tr[torch.randperm(len(X_tr))[:4_000]]
+        pL    = pde_res(model, col)
+        lam   = 250.0 * min(1.0, ep/300)
+        loss  = dL + lam*pL + λD*(torch.log(model.D+1e-4)-D0).square()
+        loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),5)
+        opt.step()
+        with torch.no_grad():
+            model.D.clamp_(0.01,0.3)
+
+        if ep%50==0:
+            model.eval(); vL=huber(model(X_te),Y_te).item()
+            hist.append((ep,dL.item(),pL.item(),vL))
+            print(f"E{ep:04d} data={dL:.3e} PDE={pL:.3e} λ={lam:6.1f} "
+                  f"test={vL:.3e} D={model.D.item():.3f}")
+            sched.step(vL)
+
+    pathlib.Path("results").mkdir(exist_ok=True)
+    tag=f"plumePINN_polish_a{args.activation}"
+    torch.save(model.state_dict(),f"results/ckpt_{tag}.pt")
+    print(f"✓ saved → results/ckpt_{tag}.pt")
+
+    if hist:
+        e,d,p,v=zip(*hist)
+        plt.semilogy(e,d,label="train Huber")
+        plt.semilogy(e,p,label="PDE")
+        plt.semilogy(e,v,label="test Huber")
+        plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend()
+        plt.tight_layout(); plt.savefig(f"results/curve_{tag}.png",dpi=120)
+        plt.show()
+
+if __name__=="__main__":
+    main()
+
