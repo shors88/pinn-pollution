@@ -9,8 +9,8 @@ import sys, pathlib, requests, pandas as pd
 west, east, south, north = map(float,
     pathlib.Path("scripts/box_denver.txt").read_text().split())
 
-# ── 2. PurpleAir API key (hard-coded) ─────────────────────────────────────────
-APIKEY = "11134252-5218-11F0-81BE-42010A80001F"   # ← your Read/Enabled key
+# ── 2. PurpleAir API key ─────────────────────────────────────────
+APIKEY = "PURPLE_AIR_API_KEY"   # ← your Read/Enabled key
 
 # ── 3. Compose and send the request ───────────────────────────────────────────
 url = (
